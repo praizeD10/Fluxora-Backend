@@ -21,7 +21,13 @@ import {
   TRUST_BOUNDARIES,
   DataClassification,
 } from '../pii/policy.js';
-import { computeAddressHash, DEFAULT_ERASURE_TOMBSTONE, redactPiiForAddress } from '../pii/pgcryptoEncryption.js';
+import {
+  computeAddressHash,
+  DEFAULT_ERASURE_TOMBSTONE,
+  redactPiiForAddress,
+  validatePgcryptoKey,
+  type PgcryptoKeySet,
+} from '../pii/pgcryptoEncryption.js';
 import { getPool, query, withClient, PoolExhaustedError } from '../db/pool.js';
 import { loadConfig } from '../config/env.js';
 import {
@@ -417,6 +423,35 @@ function classificationDescription(level: DataClassification): string {
  * @param req - Express Request containing recipientAddress parameter
  * @param res - Express Response
  */
+function resolveErasurePgcryptoKeys(req: Request): PgcryptoKeySet | null {
+  const localConfig = req.app.locals.config as
+    | { pgcryptoKey?: string; pgcryptoKeyPrevious?: string }
+    | undefined;
+
+  const current = localConfig?.pgcryptoKey ?? loadConfig().pgcryptoKey;
+  const previous = localConfig?.pgcryptoKeyPrevious ?? loadConfig().pgcryptoKeyPrevious;
+
+  if (!current) return null;
+
+  const currentValidation = validatePgcryptoKey(current);
+  if (!currentValidation.valid) {
+    logger.warn('PGCRYPTO_KEY failed validation in erasure handler', getCorrelationId(), {
+      reason: currentValidation.reason,
+    });
+    return null;
+  }
+
+  if (previous !== undefined && previous !== null && previous !== '') {
+    const prevValidation = validatePgcryptoKey(previous);
+    if (!prevValidation.valid) {
+      return { current };
+    }
+    return { current, previous };
+  }
+
+  return { current };
+}
+
 privacyRouter.delete(
   '/erasure/:recipientAddress',
   requireAdminAuth,
@@ -424,7 +459,6 @@ privacyRouter.delete(
     const { recipientAddress } = req.params;
     const correlationId = getCorrelationId();
 
-    // ── Input validation ──────────────────────────────────────────────────
     if (
       typeof recipientAddress !== 'string' ||
       recipientAddress.trim().length === 0 ||
@@ -440,10 +474,13 @@ privacyRouter.delete(
     }
 
     const address = recipientAddress.trim();
+    const keys = resolveErasurePgcryptoKeys(req);
+    const encryptionAware = keys !== null;
 
     logger.info('PII erasure request received', correlationId, {
       event: 'pii_erasure_request',
       addressPrefix: address.substring(0, 8),
+      encryptionAware,
     });
 
     const pool = getPool();
@@ -454,14 +491,18 @@ privacyRouter.delete(
     try {
       let rowsErased = 0;
       let rowsSkippedLegalHold = 0;
+      let viaPlaintextMatch = 0;
+      let viaHashMatch = 0;
 
       await withClient(pool, async (client) => {
         await client.query('BEGIN');
 
         try {
-          const result = await redactPiiForAddress(client, address, ERASURE_TOMBSTONE);
+          const result = await redactPiiForAddress(client, address, ERASURE_TOMBSTONE, keys ?? undefined);
           rowsErased = result.rowsErased;
           rowsSkippedLegalHold = result.rowsSkippedLegalHold;
+          viaPlaintextMatch = result.viaPlaintextMatch;
+          viaHashMatch = result.viaHashMatch;
 
           try {
             await recordErasureAuditLog(
@@ -475,6 +516,9 @@ privacyRouter.delete(
                 outcome: 'success',
                 rowsErased,
                 rowsSkippedLegalHold,
+                viaPlaintextMatch,
+                viaHashMatch,
+                encryptionAware,
                 action: 'GDPR_ERASURE',
               },
             );
@@ -487,6 +531,9 @@ privacyRouter.delete(
               {
                 rowsErased,
                 rowsSkippedLegalHold,
+                viaPlaintextMatch,
+                viaHashMatch,
+                encryptionAware,
                 requestedBy,
               },
             );
@@ -508,12 +555,18 @@ privacyRouter.delete(
         event: 'pii_erasure_completed',
         rowsErased,
         rowsSkippedLegalHold,
+        viaPlaintextMatch,
+        viaHashMatch,
+        encryptionAware,
       });
 
       res.status(200).json({
         erased: true,
         rowsErased,
         rowsSkippedLegalHold,
+        viaPlaintextMatch,
+        viaHashMatch,
+        encryptionAware,
         message:
           rowsSkippedLegalHold > 0
             ? `${rowsErased} row(s) erased. ${rowsSkippedLegalHold} row(s) skipped due to legal hold.`

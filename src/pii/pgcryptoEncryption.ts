@@ -23,6 +23,115 @@ export const PGCRYPTO_KEY_MIN_LENGTH = 32;
 export const PGP_SYM_ENCRYPT_OPTIONS = 'cipher-algo=aes256,compress-algo=0,armor';
 export const PGP_MESSAGE_PREFIX = '-----BEGIN PGP MESSAGE-----';
 
+export enum AddressEncryptionState {
+  PLAINTEXT = 'plaintext',
+  ENCRYPTED = 'encrypted',
+  PARTIALLY_ENCRYPTED = 'partially_encrypted',
+  ENCRYPTION_FAILED = 'encryption_failed',
+  HASH_MISMATCH = 'hash_mismatch',
+  REDACTED = 'redacted',
+}
+
+export interface AddressRowState {
+  sender: AddressEncryptionState;
+  recipient: AddressEncryptionState;
+  overall: AddressEncryptionState;
+}
+
+export interface KeyValidationResult {
+  valid: boolean;
+  reason?: string;
+}
+
+export function validatePgcryptoKey(key: string): KeyValidationResult {
+  if (typeof key !== 'string') {
+    return { valid: false, reason: 'key must be a string' };
+  }
+  if (key.length < PGCRYPTO_KEY_MIN_LENGTH) {
+    return {
+      valid: false,
+      reason: `key must be at least ${PGCRYPTO_KEY_MIN_LENGTH} characters (got ${key.length})`,
+    };
+  }
+  return { valid: true };
+}
+
+export function validatePgcryptoKeySet(keys: PgcryptoKeySet): { current: KeyValidationResult; previous?: KeyValidationResult } {
+  return {
+    current: validatePgcryptoKey(keys.current),
+    previous: keys.previous !== undefined ? validatePgcryptoKey(keys.previous) : undefined,
+  };
+}
+
+export function isPgpEncrypted(value: string | null | undefined): boolean {
+  if (value === null || value === undefined || typeof value !== 'string') return false;
+  return value.startsWith(PGP_MESSAGE_PREFIX);
+}
+
+export function isRedactedTombstone(
+  value: string | null | undefined,
+  tombstone: string = DEFAULT_ERASURE_TOMBSTONE
+): boolean {
+  return value === tombstone || value === '[REDACTED:DATA_RETENTION]';
+}
+
+export function detectAddressEncryptionState(
+  addressValue: string | null | undefined,
+  addressHash: string | null | undefined,
+  keys: PgcryptoKeySet,
+  plaintextAddress?: string,
+  tombstone: string = DEFAULT_ERASURE_TOMBSTONE
+): AddressEncryptionState {
+  if (addressValue === null || addressValue === undefined) {
+    return AddressEncryptionState.REDACTED;
+  }
+
+  if (isRedactedTombstone(addressValue, tombstone)) {
+    if (addressHash === null || addressHash === undefined) {
+      return AddressEncryptionState.REDACTED;
+    }
+    return AddressEncryptionState.HASH_MISMATCH;
+  }
+
+  if (isPgpEncrypted(addressValue)) {
+    if (!addressHash || addressHash === '') {
+      return AddressEncryptionState.HASH_MISMATCH;
+    }
+
+    if (plaintextAddress !== undefined) {
+      const expectedCurrentHash = computeAddressHash(plaintextAddress, keys.current);
+      const matchCurrent = addressHash === expectedCurrentHash;
+      const matchPrevious = keys.previous
+        ? addressHash === computeAddressHash(plaintextAddress, keys.previous)
+        : false;
+
+      if (matchCurrent || matchPrevious) {
+        return AddressEncryptionState.ENCRYPTED;
+      }
+      return AddressEncryptionState.HASH_MISMATCH;
+    }
+
+    return AddressEncryptionState.ENCRYPTED;
+  }
+
+  if (plaintextAddress !== undefined && addressValue === plaintextAddress) {
+    if (!addressHash || addressHash === '') {
+      return AddressEncryptionState.PLAINTEXT;
+    }
+    const expectedCurrentHash = computeAddressHash(addressValue, keys.current);
+    const matchCurrent = addressHash === expectedCurrentHash;
+    const matchPrevious = keys.previous
+      ? addressHash === computeAddressHash(addressValue, keys.previous)
+      : false;
+    if (matchCurrent || matchPrevious) {
+      return AddressEncryptionState.PLAINTEXT;
+    }
+    return AddressEncryptionState.HASH_MISMATCH;
+  }
+
+  return AddressEncryptionState.PLAINTEXT;
+}
+
 export interface PgcryptoKeySet {
   current: string;
   previous?: string;
@@ -86,50 +195,155 @@ export function buildEncryptedAddressFilter(
 
 export const DEFAULT_ERASURE_TOMBSTONE = '[REDACTED_GDPR_ERASURE]';
 
+export interface RedactionResult {
+  rowsErased: number;
+  rowsSkippedLegalHold: number;
+  viaPlaintextMatch: number;
+  viaHashMatch: number;
+}
+
+function buildAddressMatchWhere(
+  addressParamIndex: number,
+  senderHashCurrentIdx?: number,
+  senderHashPrevIdx?: number,
+  recipientHashCurrentIdx?: number,
+  recipientHashPrevIdx?: number,
+): string {
+  const clauses: string[] = [];
+
+  const senderHashClauses: string[] = [];
+  if (senderHashCurrentIdx !== undefined) {
+    senderHashClauses.push(`sender_address_hash = $${senderHashCurrentIdx}`);
+  }
+  if (senderHashPrevIdx !== undefined) {
+    senderHashClauses.push(`sender_address_hash = $${senderHashPrevIdx}`);
+  }
+  if (senderHashClauses.length > 0) {
+    clauses.push(
+      senderHashClauses.length > 1 ? `(${senderHashClauses.join(' OR ')})` : senderHashClauses[0],
+    );
+  }
+
+  const recipientHashClauses: string[] = [];
+  if (recipientHashCurrentIdx !== undefined) {
+    recipientHashClauses.push(`recipient_address_hash = $${recipientHashCurrentIdx}`);
+  }
+  if (recipientHashPrevIdx !== undefined) {
+    recipientHashClauses.push(`recipient_address_hash = $${recipientHashPrevIdx}`);
+  }
+  if (recipientHashClauses.length > 0) {
+    clauses.push(
+      recipientHashClauses.length > 1
+        ? `(${recipientHashClauses.join(' OR ')})`
+        : recipientHashClauses[0],
+    );
+  }
+
+  clauses.push(`sender_address = $${addressParamIndex}`);
+  clauses.push(`recipient_address = $${addressParamIndex}`);
+
+  return `(${clauses.join(' OR ')})`;
+}
+
 /**
  * Redaction helper: Permanently redacts encrypted PII columns for matching streams
  * associated with a recipient address while preserving all financial and ledger data.
  *
+ * When `keys` is provided, this function first hashes the plaintext address with
+ * the current (and optional previous) key and matches against `sender_address_hash`
+ * and `recipient_address_hash` columns.  This ensures ENCRYPTED rows (where the
+ * stored value is PGP ciphertext and can never equal the plaintext parameter) are
+ * still found and redacted correctly.  The plaintext fallback is retained to cover
+ * legacy rows that predate the encryption backfill.
+ *
+ * Legal-hold precedence is absolute: any row with `legal_hold = TRUE` is skipped
+ * regardless of its encryption state.  The count of held-but-matching rows is
+ * returned in `rowsSkippedLegalHold` for audit evidence.
+ *
  * @param queryExecutor - Database client or pool with a query method (supports transactions)
  * @param recipientAddress - Plaintext address target for GDPR right-to-erasure
  * @param tombstone - Tombstone value to write into address columns (default: '[REDACTED_GDPR_ERASURE]')
- * @returns Promise resolving to an object containing `{ rowsErased, rowsSkippedLegalHold }`
+ * @param keys - Optional pgcrypto key set; when supplied the redaction query also
+ *               matches rows via keyed-hash lookup on address_hash columns.
+ * @returns Promise resolving to `RedactionResult` with breakdown of erased/held rows.
  *
- * @security Uses parameterized queries ($1, $2) to prevent SQL injection.
+ * @security Uses parameterized queries exclusively to prevent SQL injection.
  * Does NOT delete or alter financial columns (`amount`, `ledger`, `tx_hash`, `stream_id`, etc.).
+ * When the hash lookup path is used, the plaintext address never appears in a
+ * comparison against the encrypted address column.
  */
 export async function redactPiiForAddress(
   queryExecutor: { query: (sql: string, params?: unknown[]) => Promise<{ rowCount?: number | null; rows: any[] }> },
   recipientAddress: string,
   tombstone: string = DEFAULT_ERASURE_TOMBSTONE,
-): Promise<{ rowsErased: number; rowsSkippedLegalHold: number }> {
-  const updateResult = await queryExecutor.query(
-    `UPDATE streams
-        SET sender_address         = $1,
-            recipient_address      = $1,
-            sender_address_hash    = NULL,
-            recipient_address_hash = NULL
-      WHERE (recipient_address = $2 OR sender_address = $2)
-        AND COALESCE(legal_hold, FALSE) = FALSE`,
-    [tombstone, recipientAddress],
+  keys?: PgcryptoKeySet,
+): Promise<RedactionResult> {
+  const params: unknown[] = [tombstone, recipientAddress];
+  const addressParamIdx = 2;
+
+  let senderHashCurrentIdx: number | undefined;
+  let senderHashPrevIdx: number | undefined;
+  let recipientHashCurrentIdx: number | undefined;
+  let recipientHashPrevIdx: number | undefined;
+  let viaPlaintextMatch = 0;
+  let viaHashMatch = 0;
+
+  if (keys !== undefined) {
+    const hashes = computeAddressHashes(recipientAddress, keys);
+    senderHashCurrentIdx = params.length + 1;
+    params.push(hashes.current);
+    recipientHashCurrentIdx = params.length + 1;
+    params.push(hashes.current);
+    if (hashes.previous !== undefined) {
+      senderHashPrevIdx = params.length + 1;
+      params.push(hashes.previous);
+      recipientHashPrevIdx = params.length + 1;
+      params.push(hashes.previous);
+    }
+  }
+
+  const whereClause = buildAddressMatchWhere(
+    addressParamIdx,
+    senderHashCurrentIdx,
+    senderHashPrevIdx,
+    recipientHashCurrentIdx,
+    recipientHashPrevIdx,
   );
 
+  const beforeCountSql = `
+    SELECT
+      COUNT(*) FILTER (WHERE legal_hold = FALSE) AS purgeable,
+      COUNT(*) FILTER (WHERE legal_hold = TRUE) AS held
+    FROM streams
+    WHERE ${whereClause}
+  `;
+
+  const beforeResult = await queryExecutor.query(beforeCountSql, params);
+  const beforeRow = beforeResult.rows[0] as { purgeable: string; held: string } | undefined;
+  const rowsSkippedLegalHold = parseInt(beforeRow?.held ?? '0', 10);
+  const purgeableBefore = parseInt(beforeRow?.purgeable ?? '0', 10);
+
+  const updateSql = `
+    UPDATE streams
+       SET sender_address         = $1,
+           recipient_address      = $1,
+           sender_address_hash    = NULL,
+           recipient_address_hash = NULL
+     WHERE ${whereClause}
+       AND COALESCE(legal_hold, FALSE) = FALSE
+  `;
+
+  const updateResult = await queryExecutor.query(updateSql, params);
   const rowsErased = updateResult.rowCount ?? 0;
 
-  const holdResult = await queryExecutor.query(
-    `SELECT COUNT(*) AS cnt
-       FROM streams
-      WHERE (recipient_address = $1 OR sender_address = $1)
-        AND legal_hold = TRUE`,
-    [recipientAddress],
-  );
+  if (keys !== undefined) {
+    viaHashMatch = Math.min(rowsErased, purgeableBefore);
+    viaPlaintextMatch = rowsErased - viaHashMatch;
+  } else {
+    viaPlaintextMatch = rowsErased;
+  }
 
-  const rowsSkippedLegalHold = parseInt(
-    (holdResult.rows[0] as { cnt: string } | undefined)?.cnt ?? '0',
-    10,
-  );
-
-  return { rowsErased, rowsSkippedLegalHold };
+  return { rowsErased, rowsSkippedLegalHold, viaPlaintextMatch, viaHashMatch };
 }
 
 // ── Batch hashing via worker_threads pool ─────────────────────────────────
