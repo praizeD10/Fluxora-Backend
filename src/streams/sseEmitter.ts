@@ -70,6 +70,101 @@ export interface LiveSseStreamUpdateEvent {
 
 export type SseStreamSubscriber = (event: LiveSseStreamUpdateEvent) => void;
 
+// ── Per-stream event ring buffer ───────────────────────────────────────────────
+
+/**
+ * Maximum number of recent events retained per stream in the in-process ring
+ * buffer. Events older than this cap are evicted (oldest first).
+ *
+ * This bounds memory at `SSE_REPLAY_BUFFER_SIZE × (average event size)` per
+ * active stream. At ~1 KB per event the default 200-event cap costs at most
+ * ~200 KB per stream, which is acceptable given the O(1) eviction policy.
+ *
+ * Override via `SSE_REPLAY_BUFFER_SIZE` env var (positive integer).
+ */
+export const SSE_REPLAY_BUFFER_SIZE = (() => {
+  const raw = parseInt(process.env.SSE_REPLAY_BUFFER_SIZE ?? '200', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 200;
+})();
+
+/**
+ * Thrown when a client resumes with a `Last-Event-ID` that has already been
+ * evicted from the ring buffer. The client must re-fetch full stream state
+ * rather than attempting incremental resumption.
+ *
+ * The route handler surfaces this as an `event: error` SSE frame with code
+ * `SSE_REPLAY_EXPIRED` so clients can distinguish it from other errors and
+ * fall through to the persistent event store.
+ */
+export class SseReplayExpiredError extends Error {
+  readonly code = 'SSE_REPLAY_EXPIRED' as const;
+  constructor(public readonly afterEventId: string) {
+    super(
+      `Replay cursor '${afterEventId}' is beyond the in-process retention window; ` +
+      `resync from the event store`,
+    );
+    this.name = 'SseReplayExpiredError';
+  }
+}
+
+/** Ring buffer keyed by streamId, storing recent live events in insertion order. */
+const replayBufferByStreamId = new Map<string, LiveSseStreamUpdateEvent[]>();
+
+/**
+ * Append a live event to the per-stream ring buffer, evicting the oldest entry
+ * when the buffer is full. O(1) amortized: eviction is a single `shift()` on
+ * a pre-bounded array.
+ *
+ * Called by `dispatchLiveSseEvent` before fan-out, so the event is always
+ * in the buffer before any subscriber callback can observe it.
+ */
+function bufferLiveEvent(event: LiveSseStreamUpdateEvent): void {
+  let buf = replayBufferByStreamId.get(event.streamId);
+  if (!buf) {
+    buf = [];
+    replayBufferByStreamId.set(event.streamId, buf);
+  }
+  buf.push(event);
+  if (buf.length > SSE_REPLAY_BUFFER_SIZE) {
+    buf.shift(); // evict oldest
+  }
+}
+
+/**
+ * Return all buffered events for `streamId` that were emitted strictly after
+ * the event identified by `afterEventId`, in emission order.
+ *
+ * @throws {SseReplayExpiredError} when `afterEventId` is not present in the
+ *   buffer — it has been evicted and the client must resync from the persistent
+ *   event store.
+ *
+ * Returns an empty array (no error) when `afterEventId` is the most recent
+ * buffered event — there are no new events to replay.
+ */
+export function replayFromBuffer(
+  streamId: string,
+  afterEventId: string,
+): LiveSseStreamUpdateEvent[] {
+  const buf = replayBufferByStreamId.get(streamId);
+
+  // No buffer → either the stream has never emitted in this process lifetime,
+  // or the process was restarted. Treat as expiry so callers fall through to
+  // the persistent event store.
+  if (!buf || buf.length === 0) {
+    throw new SseReplayExpiredError(afterEventId);
+  }
+
+  const idx = buf.findIndex((e) => e.eventId === afterEventId);
+  if (idx === -1) {
+    throw new SseReplayExpiredError(afterEventId);
+  }
+
+  // Everything strictly after the cursor position.
+  return buf.slice(idx + 1);
+}
+
+// ── Live subscriber fan-out ───────────────────────────────────────────────────
+
 const liveSubscribersByStreamId = new Map<string, Set<SseStreamSubscriber>>();
 
 function totalLiveSubscriberCount(): number {
@@ -83,6 +178,11 @@ function totalLiveSubscriberCount(): number {
 function dispatchLiveSseEvent(event: LiveSseStreamUpdateEvent): void {
   if (!event || typeof event.streamId !== 'string') return;
 
+  // Buffer before fan-out so subscribers racing with a replay call always
+  // see a consistent ordering — buffer.push happens before any subscriber
+  // can observe the event, preventing a gap between replay and live delivery.
+  bufferLiveEvent(event);
+
   const subscribers = liveSubscribersByStreamId.get(event.streamId);
   if (!subscribers || subscribers.size === 0) return;
 
@@ -93,7 +193,6 @@ function dispatchLiveSseEvent(event: LiveSseStreamUpdateEvent): void {
       subscriber(event);
     } catch (err) {
       // Isolate one failing connection from the rest of the stream fan-out.
-      // Observability: meter + structured log so persistent listeners are visible.
       sseSubscriberErrorsTotal.inc({ reason: 'subscriber_callback_throw' });
 
       const error = err instanceof Error ? err : new Error(String(err));
@@ -138,7 +237,7 @@ function detachDispatchIfIdle(): void {
  */
 export function subscribeToSseStream(
   streamId: string,
-  subscriber: SseStreamSubscriber
+  subscriber: SseStreamSubscriber,
 ): () => void {
   let subscribers = liveSubscribersByStreamId.get(streamId);
   if (!subscribers) {
@@ -147,8 +246,8 @@ export function subscribeToSseStream(
   }
 
   subscribers.add(subscriber);
-   ensureDispatchAttached();
-   sseLiveSubscribersGauge.set(Math.max(0, totalLiveSubscriberCount()));
+  ensureDispatchAttached();
+  sseLiveSubscribersGauge.set(Math.max(0, totalLiveSubscriberCount()));
 
   let unsubscribed = false;
   return () => {
@@ -163,7 +262,7 @@ export function subscribeToSseStream(
       liveSubscribersByStreamId.delete(streamId);
     }
     detachDispatchIfIdle();
-  sseLiveSubscribersGauge.set(Math.max(0, totalLiveSubscriberCount()));
+    sseLiveSubscribersGauge.set(Math.max(0, totalLiveSubscriberCount()));
   };
 }
 
@@ -181,16 +280,8 @@ export interface SseBackpressureOptions {
  * Register a live SSE subscriber with per-connection backpressure protection.
  *
  * Wraps the subscriber callback with a buffer counter. When the buffer exceeds
- * `maxBufferedEvents`, the connection is dropped via `onBackpressureDrop` callback
- * and the `sseBackpressureDropsTotal` metric is incremented.
- *
- * This prevents unbounded memory growth when a slow consumer cannot drain events
- * fast enough (DoS vector).
- *
- * @param streamId - Stream ID to subscribe to
- * @param subscriber - Original subscriber callback
- * @param options - Backpressure configuration
- * @returns Unsubscribe function
+ * `maxBufferedEvents`, the connection is dropped via `onBackpressureDrop` and
+ * the `sseBackpressureDropsTotal` metric is incremented.
  */
 export function subscribeToSseStreamWithBackpressure(
   streamId: string,
@@ -222,10 +313,10 @@ export function subscribeToSseStreamWithBackpressure(
 
     try {
       subscriber(event);
-      bufferedCount--;  // Only decrement on successful delivery
+      bufferedCount--; // Only decrement on successful delivery
     } catch (err) {
-      // Don't decrement - event is still buffered (not drained by slow consumer)
-      // Re-throw so upstream error handling (sseSubscriberErrorsTotal) works
+      // Don't decrement — event is still buffered (not drained by slow consumer).
+      // Re-throw so upstream error handling (sseSubscriberErrorsTotal) fires.
       throw err;
     }
   };
@@ -259,15 +350,10 @@ const sseShutdownCallbacks = new Set<SseShutdownEntry>();
  * Register a shutdown callback for an active SSE response.
  * The returned deregister function must be called when the connection closes
  * normally so the Set does not grow unboundedly.
- *
- * @param drain      - Callback that writes `retry: 0` and ends the response.
- *                     May return a Promise for async drain operations.
- * @param forceClose - Optional callback that destroys the socket after timeout.
- * @returns Deregister function.
  */
 export function registerSseShutdownCallback(
   drain: () => void | Promise<void>,
-  forceClose?: () => void
+  forceClose?: () => void,
 ): () => void {
   const entry: SseShutdownEntry = { drain, forceClose };
   sseShutdownCallbacks.add(entry);
@@ -275,17 +361,14 @@ export function registerSseShutdownCallback(
 }
 
 /**
- * Run a single callback with a timeout and return whether it completed
- * before the deadline.
- *
- * Uses Promise.race to race the drain callback (which may be async) against
- * a timer.  A settled guard prevents forceClose from firing after a
- * successful drain, and vice versa.
+ * Run a single callback with a timeout; returns whether it completed before
+ * the deadline. Uses Promise.race so a settled guard prevents forceClose from
+ * firing after a successful drain and vice versa.
  */
 async function raceDrainCallback(
   drain: () => void | Promise<void>,
   forceClose: (() => void) | undefined,
-  timeoutMs: number
+  timeoutMs: number,
 ): Promise<boolean> {
   let settled = false;
 
@@ -297,9 +380,8 @@ async function raceDrainCallback(
     }
     if (!settled) {
       settled = true;
-      return true; // completed (possibly with error) before timeout
+      return true;
     }
-    // Timeout already won — this value won't be consumed by Promise.race.
     return true;
   })();
 
@@ -310,7 +392,6 @@ async function raceDrainCallback(
       forceClose?.();
       resolve(false);
     }, timeoutMs);
-    // Don't let the timer keep the event loop alive.
     if (typeof timer.unref === 'function') timer.unref();
   });
 
@@ -321,14 +402,11 @@ async function raceDrainCallback(
  * Drain all open SSE connections on shutdown.
  *
  * Each registered SSE connection is given up to `timeoutMs` to write a
- * `retry: 0` directive and end gracefully.  Connections that do not complete
- * within the per-stream budget are force-closed via their registered
- * forceClose callback.
+ * `retry: 0` directive and end gracefully. Connections that do not complete
+ * within the per-stream budget are force-closed via their forceClose callback.
  *
- * After all connections are drained, the shared dispatch listener and
- * subscriber state are torn down.
- *
- * @param timeoutMs - Per-connection drain timeout in milliseconds.
+ * After all connections are drained, the shared dispatch listener, subscriber
+ * state, and replay buffers are torn down.
  */
 export async function drainSseEventBus(timeoutMs: number): Promise<void> {
   const entries = Array.from(sseShutdownCallbacks);
@@ -351,8 +429,9 @@ export async function drainSseEventBus(timeoutMs: number): Promise<void> {
     });
   }
 
-  // Tear down the shared dispatcher so no further events are fanned out.
+  // Tear down the shared dispatcher and replay state.
   liveSubscribersByStreamId.clear();
+  replayBufferByStreamId.clear();
   sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
   sseLiveSubscribersGauge.set(0);
   sseEventListenersGauge.set(0);
@@ -360,6 +439,7 @@ export async function drainSseEventBus(timeoutMs: number): Promise<void> {
 
 export function _resetSseSubscriptionsForTest(): void {
   liveSubscribersByStreamId.clear();
+  replayBufferByStreamId.clear();
   sseEventBus.off(SSE_STREAM_UPDATE_EVENT, dispatchLiveSseEvent);
   sseShutdownCallbacks.clear();
   sseLiveSubscribersGauge.set(0);
@@ -375,9 +455,6 @@ export function _resetSseSubscriptionsForTest(): void {
  * This is the single source of truth for stream ID derivation. Both the SSE
  * matching logic and the ingestion service (`streamEventService`) must import
  * and call this helper so that the format cannot silently diverge.
- *
- * @param transactionHash - The Stellar transaction hash (hex string)
- * @param eventIndex      - The zero-based event index within the transaction
  */
 export function deriveStreamId(transactionHash: string, eventIndex: number): string {
   return `stream-${transactionHash}-${eventIndex}`;
@@ -389,10 +466,6 @@ export function deriveStreamId(transactionHash: string, eventIndex: number): str
  * Matching strategy (first match wins):
  * 1. Explicit `id` or `streamId` field inside the event payload.
  * 2. Canonical derivation via `deriveStreamId(event.txHash, event.eventIndex)`.
- *
- * Using the shared `deriveStreamId` helper guarantees that the format used here
- * stays in sync with the ingestion path — the previous inline template literal
- * was a divergence risk.
  */
 export function eventMatchesStreamId(event: StreamEventRecord, id: string): boolean {
   if (!event || !id) return false;
